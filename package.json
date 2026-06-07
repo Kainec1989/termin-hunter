@@ -1,0 +1,33 @@
+{
+  "name": "termin-hunter",
+  "version": "1.0.0",
+  "description": "Автоматическая проверка свободных слотов Zulassungsstelle Leipzig с уведомлениями в Telegram",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "leipzig",
+    "zulassungsstelle",
+    "termin",
+    "playwright",
+    "telegram"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.50.1",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
