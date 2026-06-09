@@ -22,6 +22,7 @@ export interface CalendarNavigationResult {
   uid: string;
   wsid: string;
   bookingUrl: string;
+  serviceUid?: string;
 }
 
 async function humanPause(page: Page, baseMs = HUMAN_DELAY_MS): Promise<void> {
@@ -64,7 +65,7 @@ async function waitForServicesLoaded(page: Page): Promise<void> {
 }
 
 /** Выбирает «Technische Änderung» через dropdown (quantity = 1) */
-async function selectTargetService(page: Page): Promise<void> {
+async function selectTargetService(page: Page): Promise<string | undefined> {
   const serviceContainer = page
     .locator('.service_container')
     .filter({ hasText: TEXT_SERVICE_VEHICLE_CORRECTION })
@@ -84,7 +85,18 @@ async function selectTargetService(page: Page): Promise<void> {
   await humanPause(page);
   await select.selectOption(SERVICE_QUANTITY);
 
-  log(`Услуга выбрана: Technische Änderung (quantity=${SERVICE_QUANTITY})`);
+  const serviceUid =
+    (await serviceContainer.getAttribute('data-service-id')) ??
+    (await serviceContainer.getAttribute('data-uid')) ??
+    undefined;
+
+  if (serviceUid) {
+    log(`Услуга выбрана: Technische Änderung (serviceUid=${serviceUid.slice(0, 8)}…)`);
+  } else {
+    log(`Услуга выбрана: Technische Änderung (quantity=${SERVICE_QUANTITY})`);
+  }
+
+  return serviceUid ?? undefined;
 }
 
 async function clickWizardNext(page: Page): Promise<void> {
@@ -137,7 +149,7 @@ export async function navigateToCalendar(page: Page): Promise<CalendarNavigation
   await page.waitForTimeout(PAGE_SETTLE_MS);
 
   await waitForServicesLoaded(page);
-  await selectTargetService(page);
+  const serviceUid = await selectTargetService(page);
   await clickWizardNext(page);
 
   await page.waitForLoadState('domcontentloaded');
@@ -168,5 +180,5 @@ export async function navigateToCalendar(page: Page): Promise<CalendarNavigation
 
   log(`Сессия извлечена: uid=${parsed.uid.slice(0, 8)}… wsid=${parsed.wsid.slice(0, 8)}…`);
 
-  return parsed;
+  return { ...parsed, serviceUid };
 }

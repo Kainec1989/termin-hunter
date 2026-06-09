@@ -14,13 +14,16 @@ export interface SmartCxSession {
   createdAt: number;
   /** Cookies браузера — нужны для API search_result */
   cookies?: Cookie[];
+  /** UUID услуги из data-service-id (если отличается от portal uid) */
+  serviceUid?: string;
 }
 
 const SESSION_FILE = join(process.cwd(), '.session.json');
 
 let currentSession: SmartCxSession | null = null;
 
-const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? '3600000', 10);
+export const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? '900000', 10);
+export const SESSION_REFRESH_MS = parseInt(process.env.SESSION_REFRESH_MS ?? '720000', 10);
 
 export function parseSessionFromUrl(url: string): Pick<SmartCxSession, 'uid' | 'wsid' | 'bookingUrl'> | null {
   try {
@@ -34,6 +37,24 @@ export function parseSessionFromUrl(url: string): Pick<SmartCxSession, 'uid' | '
   } catch {
     return null;
   }
+}
+
+/** uid для API-запросов: service-specific, если известен */
+export function getApiUid(session: SmartCxSession): string {
+  return session.serviceUid ?? session.uid;
+}
+
+export function sessionAgeMs(session: SmartCxSession): number {
+  return Date.now() - session.createdAt;
+}
+
+export function sessionAgeMinutes(session: SmartCxSession): number {
+  return Math.round(sessionAgeMs(session) / 60_000);
+}
+
+export function needsSessionRefresh(session: SmartCxSession | null): boolean {
+  if (!session) return true;
+  return sessionAgeMs(session) >= SESSION_REFRESH_MS;
 }
 
 export function loadSession(): SmartCxSession | null {
@@ -73,6 +94,7 @@ function loadSessionFromEnv(): SmartCxSession | null {
     wsid,
     bookingUrl,
     createdAt: Date.now(),
+    serviceUid: process.env.SERVICE_UID,
   };
 }
 
@@ -106,7 +128,10 @@ export function saveSession(session: Omit<SmartCxSession, 'createdAt'>): SmartCx
 
   try {
     writeFileSync(SESSION_FILE, JSON.stringify(full, null, 2), 'utf-8');
-    log(`Сессия сохранена (uid=${full.uid.slice(0, 8)}…, cookies=${full.cookies?.length ?? 0})`);
+    const serviceNote = full.serviceUid && full.serviceUid !== full.uid
+      ? `, serviceUid=${full.serviceUid.slice(0, 8)}…`
+      : '';
+    log(`Сессия сохранена (uid=${full.uid.slice(0, 8)}…, cookies=${full.cookies?.length ?? 0}${serviceNote})`);
   } catch {
     log('Не удалось сохранить .session.json — сессия только в памяти');
   }
@@ -131,8 +156,7 @@ export function invalidateSession(): void {
 export function isSessionValid(session: SmartCxSession | null): boolean {
   if (!session?.uid || !session?.wsid) return false;
 
-  const age = Date.now() - session.createdAt;
-  return age < SESSION_TTL_MS;
+  return sessionAgeMs(session) < SESSION_TTL_MS;
 }
 
 export function hasValidSession(): boolean {

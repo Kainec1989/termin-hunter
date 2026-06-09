@@ -3,8 +3,10 @@
  */
 
 import { Telegraf, Markup } from 'telegraf';
-import type { ApiSlot } from './api';
+import type { ApiSlot, PollDiagnostics } from './api';
+import { getLastPollDiagnostics } from './api';
 import type { SmartCxSession } from './session';
+import { sessionAgeMinutes, SESSION_TTL_MS, SESSION_REFRESH_MS } from './session';
 import { enrichBookingLink, getCalendarUrl } from './api';
 import { getBerlinTimeString, getWorkHoursLabel, isWithinWorkingHours } from './schedule';
 import { log } from './logger';
@@ -15,6 +17,13 @@ let forceCheckCallback: (() => void) | null = null;
 let monitoringActive = true;
 let lastCheckAt: string | null = null;
 let lastCheckResult: string | null = null;
+
+let schedulerPollMode: string | null = null;
+let nextCheckSec: number | null = null;
+let currentSession: SmartCxSession | null = null;
+let bootstrapCount = 0;
+let checkCount = 0;
+let errorCount = 0;
 
 const sentSlotKeys = new Set<string>();
 
@@ -63,6 +72,28 @@ export function recordCheckResult(result: string): void {
   lastCheckResult = result;
 }
 
+export function updateSchedulerStatus(opts: {
+  pollMode: string;
+  nextCheckSec: number;
+  session: SmartCxSession | null;
+}): void {
+  schedulerPollMode = opts.pollMode;
+  nextCheckSec = opts.nextCheckSec;
+  currentSession = opts.session;
+}
+
+export function incrementBootstrapCount(): void {
+  bootstrapCount += 1;
+}
+
+export function incrementCheckCount(): void {
+  checkCount += 1;
+}
+
+export function recordError(): void {
+  errorCount += 1;
+}
+
 function slotKey(slot: ApiSlot): string {
   return slot.datetime_iso86001 ?? `${slot.date_time}|${slot.link}`;
 }
@@ -72,6 +103,21 @@ function escapeHtml(text: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function formatApiDiagnostics(diag: PollDiagnostics | null): string {
+  if (!diag) return 'нет данных';
+
+  const flags = [
+    diag.no_slots ? 'no_slots' : null,
+    diag.session_expired ? 'session_expired' : null,
+    diag.has_json_div ? 'json_div' : null,
+    diag.ambiguous ? 'ambiguous' : null,
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  return `HTTP ${diag.http_status}, ${diag.slot_count} слотов, ${flags || 'ok'}`;
 }
 
 function stopKeyboard() {
@@ -89,11 +135,43 @@ function statusText(): string {
     `▶️ Мониторинг: ${monitoringActive && isWithinWorkingHours() ? 'активен' : 'остановлен'}`,
   ];
 
+  if (schedulerPollMode) {
+    lines.push(`⚡ Режим опроса: ${escapeHtml(schedulerPollMode)}`);
+  }
+
+  if (nextCheckSec !== null) {
+    lines.push(`⏱ Следующая проверка: ~${nextCheckSec} сек`);
+  }
+
+  if (currentSession) {
+    const ageMin = sessionAgeMinutes(currentSession);
+    const ttlMin = Math.round(SESSION_TTL_MS / 60_000);
+    const refreshMin = Math.round(SESSION_REFRESH_MS / 60_000);
+    lines.push(
+      `🔑 Сессия: ${ageMin} мин (TTL ${ttlMin} мин, refresh ${refreshMin} мин)`,
+    );
+    if (currentSession.serviceUid && currentSession.serviceUid !== currentSession.uid) {
+      lines.push(`   serviceUid: ${escapeHtml(currentSession.serviceUid.slice(0, 8))}…`);
+    }
+  } else {
+    lines.push('🔑 Сессия: отсутствует');
+  }
+
   if (lastCheckAt) {
     lines.push(`🔍 Последняя проверка: ${escapeHtml(lastCheckAt)} — ${escapeHtml(lastCheckResult ?? '')}`);
   }
 
-  lines.push('', 'Команды: /status /stop /check');
+  const diag = getLastPollDiagnostics();
+  if (diag) {
+    lines.push(`📡 API: ${escapeHtml(formatApiDiagnostics(diag))}`);
+  }
+
+  lines.push(
+    '',
+    `📊 Сегодня: ${checkCount} проверок, ${bootstrapCount} bootstrap, ${errorCount} ошибок`,
+    '',
+    'Команды: /status /stop /check',
+  );
 
   return lines.join('\n');
 }

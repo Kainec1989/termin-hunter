@@ -5,9 +5,11 @@
  * а не чистый JSON (см. aachen-termin-bot, leipzigappointmentsbot).
  */
 
+import { writeFileSync } from 'fs';
+import { join } from 'path';
 import type { Page } from 'playwright';
-import { API_BASE_URL, API_SEARCH_MODE, USER_AGENT } from './config';
-import { buildCookieHeader, type SmartCxSession } from './session';
+import { API_BASE_URL, API_SEARCH_MODES, USER_AGENT } from './config';
+import { buildCookieHeader, getApiUid, type SmartCxSession } from './session';
 import { log } from './logger';
 
 export interface ApiSlot {
@@ -18,6 +20,19 @@ export interface ApiSlot {
   duration?: string;
 }
 
+export interface PollDiagnostics {
+  timestamp: string;
+  search_modes: string[];
+  http_status: number;
+  response_length: number;
+  slot_count: number;
+  no_slots: boolean;
+  session_expired: boolean;
+  has_json_div: boolean;
+  ambiguous: boolean;
+  response_preview: string;
+}
+
 export class SessionExpiredError extends Error {
   constructor(message: string) {
     super(message);
@@ -25,10 +40,35 @@ export class SessionExpiredError extends Error {
   }
 }
 
-function buildSearchUrl(session: SmartCxSession): string {
+export class AmbiguousResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AmbiguousResponseError';
+  }
+}
+
+const LAST_CHECK_FILE = join(process.cwd(), '.last-check.json');
+
+let lastPollDiagnostics: PollDiagnostics | null = null;
+
+export function getLastPollDiagnostics(): PollDiagnostics | null {
+  return lastPollDiagnostics;
+}
+
+function saveLastCheck(diagnostics: PollDiagnostics): void {
+  lastPollDiagnostics = diagnostics;
+
+  try {
+    writeFileSync(LAST_CHECK_FILE, JSON.stringify(diagnostics, null, 2), 'utf-8');
+  } catch {
+    // ignore
+  }
+}
+
+function buildSearchUrl(session: SmartCxSession, searchMode: string): string {
   const params = new URLSearchParams({
-    search_mode: API_SEARCH_MODE,
-    uid: session.uid,
+    search_mode: searchMode,
+    uid: getApiUid(session),
     wsid: session.wsid,
     lang: 'de',
   });
@@ -55,8 +95,6 @@ function normalizeLink(link: string): string {
   return `https://terminvereinbarung.leipzig.de/${trimmed}`;
 }
 
-const BOOKING_ORIGIN = 'https://terminvereinbarung.leipzig.de';
-
 /**
  * Дополняет ссылку uid/wsid/lang — без wsid слот на другом устройстве
  * часто открывает session_expired вместо формы бронирования.
@@ -64,12 +102,13 @@ const BOOKING_ORIGIN = 'https://terminvereinbarung.leipzig.de';
 export function enrichBookingLink(rawLink: string, session: SmartCxSession): string {
   try {
     const url = new URL(normalizeLink(rawLink));
+    const apiUid = getApiUid(session);
 
     if (!url.searchParams.has('wsid')) {
       url.searchParams.set('wsid', session.wsid);
     }
     if (!url.searchParams.has('uid')) {
-      url.searchParams.set('uid', session.uid);
+      url.searchParams.set('uid', apiUid);
     }
     if (!url.searchParams.has('lang')) {
       url.searchParams.set('lang', 'de');
@@ -176,34 +215,85 @@ function isNoSlotsHtml(html: string): boolean {
   return /Keine freien Termine gefunden|nothing_Found|nothing_found/i.test(html);
 }
 
+function hasJsonAppointmentList(html: string): boolean {
+  return /id=["']json_appointment_list["']/i.test(html);
+}
+
+function isAmbiguousHtml(html: string): boolean {
+  if (!html.trim()) return true;
+  if (isSessionExpiredHtml(html)) return false;
+  if (isNoSlotsHtml(html)) return false;
+  if (hasJsonAppointmentList(html)) return false;
+  if (parseSlotsFromText(html).length > 0) return false;
+
+  return true;
+}
+
+interface HtmlParseResult {
+  slots: ApiSlot[];
+  no_slots: boolean;
+  session_expired: boolean;
+  has_json_div: boolean;
+  ambiguous: boolean;
+}
+
 /** Парсит HTML-ответ search_result (основной формат Smart CX) */
-function parseSlotsFromHtml(html: string): ApiSlot[] {
+function parseSlotsFromHtml(html: string, throwOnAmbiguous = true): HtmlParseResult {
   if (isSessionExpiredHtml(html)) {
     throw new SessionExpiredError('Сессия wsid истекла (session_expired)');
   }
 
   if (isNoSlotsHtml(html)) {
-    return [];
+    return { slots: [], no_slots: true, session_expired: false, has_json_div: false, ambiguous: false };
   }
 
+  const hasJsonDiv = hasJsonAppointmentList(html);
   const jsonDiv = html.match(/id=["']json_appointment_list["'][^>]*>([\s\S]*?)<\/div>/i);
 
   if (jsonDiv?.[1]) {
     try {
       const data = JSON.parse(decodeHtmlEntities(jsonDiv[1].trim())) as unknown;
-      return normalizeResponse(data);
+      return {
+        slots: normalizeResponse(data),
+        no_slots: false,
+        session_expired: false,
+        has_json_div: true,
+        ambiguous: false,
+      };
     } catch {
       log('json_appointment_list найден, но JSON не распарсился');
     }
   }
 
-  return parseSlotsFromText(html);
+  const textSlots = parseSlotsFromText(html);
+
+  if (textSlots.length > 0) {
+    return {
+      slots: textSlots,
+      no_slots: false,
+      session_expired: false,
+      has_json_div: hasJsonDiv,
+      ambiguous: false,
+    };
+  }
+
+  if (throwOnAmbiguous && isAmbiguousHtml(html)) {
+    throw new AmbiguousResponseError('Неоднозначный ответ API — вероятно устаревшая сессия');
+  }
+
+  return {
+    slots: [],
+    no_slots: false,
+    session_expired: false,
+    has_json_div: hasJsonDiv,
+    ambiguous: isAmbiguousHtml(html),
+  };
 }
 
 /** Парсит тело ответа search_result (HTML или JSON) */
-function parseResponseBody(text: string): ApiSlot[] {
+function parseResponseBody(text: string): HtmlParseResult {
   if (!text.trim() || text.trim() === '[]') {
-    return [];
+    return { slots: [], no_slots: true, session_expired: false, has_json_div: false, ambiguous: false };
   }
 
   if (text.trimStart().startsWith('<')) {
@@ -211,10 +301,99 @@ function parseResponseBody(text: string): ApiSlot[] {
   }
 
   try {
-    return normalizeResponse(JSON.parse(text) as unknown);
+    return {
+      slots: normalizeResponse(JSON.parse(text) as unknown),
+      no_slots: false,
+      session_expired: false,
+      has_json_div: false,
+      ambiguous: false,
+    };
   } catch {
-    return parseSlotsFromText(text);
+    const textSlots = parseSlotsFromText(text);
+    return {
+      slots: textSlots,
+      no_slots: textSlots.length === 0,
+      session_expired: false,
+      has_json_div: false,
+      ambiguous: textSlots.length === 0,
+    };
   }
+}
+
+function slotDedupKey(slot: ApiSlot): string {
+  return slot.datetime_iso86001 ?? `${slot.date_time}|${slot.link}`;
+}
+
+function mergeSlots(slotsLists: ApiSlot[][]): ApiSlot[] {
+  const seen = new Set<string>();
+  const merged: ApiSlot[] = [];
+
+  for (const slots of slotsLists) {
+    for (const slot of slots) {
+      const key = slotDedupKey(slot);
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(slot);
+      }
+    }
+  }
+
+  return merged;
+}
+
+function recordDiagnostics(
+  modes: readonly string[],
+  httpStatus: number,
+  body: string,
+  slots: ApiSlot[],
+  flags: Pick<PollDiagnostics, 'no_slots' | 'session_expired' | 'has_json_div' | 'ambiguous'>,
+): void {
+  saveLastCheck({
+    timestamp: new Date().toISOString(),
+    search_modes: [...modes],
+    http_status: httpStatus,
+    response_length: body.length,
+    slot_count: slots.length,
+    no_slots: flags.no_slots,
+    session_expired: flags.session_expired,
+    has_json_div: flags.has_json_div,
+    ambiguous: flags.ambiguous,
+    response_preview: body.slice(0, 200),
+  });
+}
+
+async function fetchSearchResult(
+  session: SmartCxSession,
+  searchMode: string,
+): Promise<{ body: string; status: number; parse: HtmlParseResult }> {
+  const url = buildSearchUrl(session, searchMode);
+  const cookieHeader = buildCookieHeader(session);
+
+  const headers: Record<string, string> = {
+    Accept: 'text/html, application/json, */*',
+    'Accept-Language': 'de-DE,de;q=0.9',
+    'User-Agent': USER_AGENT,
+    Referer: session.bookingUrl,
+  };
+
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader;
+  }
+
+  const response = await fetch(url, { headers });
+  const body = await response.text();
+
+  if (response.status === 401 || response.status === 403) {
+    throw new SessionExpiredError(`HTTP ${response.status}: сессия wsid истекла`);
+  }
+
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`API вернул HTTP ${response.status}`);
+  }
+
+  const parse = parseResponseBody(body);
+
+  return { body, status: response.status, parse };
 }
 
 /** Сканирует открытую страницу search_results (bootstrap) */
@@ -247,66 +426,112 @@ export async function scrapeSlotsFromPage(page: Page): Promise<ApiSlot[]> {
     return domSlots;
   }
 
-  return parseSlotsFromHtml(html);
+  return parseSlotsFromHtml(html, false).slots;
 }
 
 export async function pollSlots(session: SmartCxSession): Promise<ApiSlot[]> {
-  const url = buildSearchUrl(session);
-  const cookieHeader = buildCookieHeader(session);
-
-  log(`API-опрос: ${API_SEARCH_MODE} (uid=${session.uid.slice(0, 8)}…)`);
-
-  const headers: Record<string, string> = {
-    Accept: 'text/html, application/json, */*',
-    'Accept-Language': 'de-DE,de;q=0.9',
-    'User-Agent': USER_AGENT,
-    Referer: session.bookingUrl,
+  const modes = API_SEARCH_MODES;
+  const allSlots: ApiSlot[] = [];
+  let lastBody = '';
+  let lastStatus = 200;
+  let lastFlags: Pick<PollDiagnostics, 'no_slots' | 'session_expired' | 'has_json_div' | 'ambiguous'> = {
+    no_slots: true,
+    session_expired: false,
+    has_json_div: false,
+    ambiguous: false,
   };
 
-  if (cookieHeader) {
-    headers.Cookie = cookieHeader;
+  log(`API-опрос: ${modes.join(' + ')} (uid=${getApiUid(session).slice(0, 8)}…)`);
+
+  for (const mode of modes) {
+    const { body, status, parse } = await fetchSearchResult(session, mode);
+    lastBody = body;
+    lastStatus = status;
+    lastFlags = {
+      no_slots: parse.no_slots,
+      session_expired: parse.session_expired,
+      has_json_div: parse.has_json_div,
+      ambiguous: parse.ambiguous,
+    };
+    allSlots.push(...parse.slots);
   }
 
-  const response = await fetch(url, { headers });
+  const merged = mergeSlots([allSlots]);
 
-  if (response.status === 401 || response.status === 403) {
-    throw new SessionExpiredError(`HTTP ${response.status}: сессия wsid истекла`);
-  }
+  recordDiagnostics(modes, lastStatus, lastBody, merged, {
+    ...lastFlags,
+    no_slots: merged.length === 0 && lastFlags.no_slots,
+  });
 
-  if (!response.ok && response.status !== 404) {
-    throw new Error(`API вернул HTTP ${response.status}`);
-  }
-
-  return parseResponseBody(await response.text());
+  return merged;
 }
 
 export async function pollSlotsWithContext(
   context: import('playwright').BrowserContext,
   session: SmartCxSession,
 ): Promise<ApiSlot[]> {
-  const url = buildSearchUrl(session);
+  const modes = API_SEARCH_MODES;
+  const allSlots: ApiSlot[] = [];
+  let lastBody = '';
+  let lastStatus = 200;
+  let lastFlags: Pick<PollDiagnostics, 'no_slots' | 'session_expired' | 'has_json_div' | 'ambiguous'> = {
+    no_slots: true,
+    session_expired: false,
+    has_json_div: false,
+    ambiguous: false,
+  };
 
-  log(`API-опрос (browser): ${API_SEARCH_MODE} (uid=${session.uid.slice(0, 8)}…)`);
+  log(`API-опрос (browser): ${modes.join(' + ')} (uid=${getApiUid(session).slice(0, 8)}…)`);
 
-  const response = await context.request.get(url, {
-    headers: {
-      Accept: 'text/html, application/json, */*',
-      'Accept-Language': 'de-DE,de;q=0.9',
-      Referer: session.bookingUrl,
-    },
-  });
+  for (const mode of modes) {
+    const url = buildSearchUrl(session, mode);
 
-  if ([401, 403].includes(response.status())) {
-    throw new SessionExpiredError(`HTTP ${response.status()}: сессия wsid истекла`);
+    const response = await context.request.get(url, {
+      headers: {
+        Accept: 'text/html, application/json, */*',
+        'Accept-Language': 'de-DE,de;q=0.9',
+        Referer: session.bookingUrl,
+      },
+    });
+
+    if ([401, 403].includes(response.status())) {
+      throw new SessionExpiredError(`HTTP ${response.status()}: сессия wsid истекла`);
+    }
+
+    const body = await response.text();
+    const parse = parseResponseBody(body);
+
+    lastBody = body;
+    lastStatus = response.status();
+    lastFlags = {
+      no_slots: parse.no_slots,
+      session_expired: parse.session_expired,
+      has_json_div: parse.has_json_div,
+      ambiguous: parse.ambiguous,
+    };
+    allSlots.push(...parse.slots);
   }
 
-  return parseResponseBody(await response.text());
+  const merged = mergeSlots([allSlots]);
+
+  recordDiagnostics(modes, lastStatus, lastBody, merged, {
+    ...lastFlags,
+    no_slots: merged.length === 0 && lastFlags.no_slots,
+  });
+
+  return merged;
 }
 
 export async function pollSlotsFromPage(page: Page, session: SmartCxSession): Promise<ApiSlot[]> {
   const domSlots = await scrapeSlotsFromPage(page);
 
   if (domSlots.length > 0) {
+    recordDiagnostics(['dom'], 200, '', domSlots, {
+      no_slots: false,
+      session_expired: false,
+      has_json_div: false,
+      ambiguous: false,
+    });
     return domSlots;
   }
 

@@ -3,14 +3,24 @@
  */
 
 import 'dotenv/config';
-import { pollSlots, pollSlotsFromPage, SessionExpiredError, enrichSlotsForBooking } from './api';
-import { createBrowserSession, closeBrowserSession } from './browser';
+import {
+  pollSlots,
+  pollSlotsFromPage,
+  pollSlotsWithContext,
+  scrapeSlotsFromPage,
+  SessionExpiredError,
+  AmbiguousResponseError,
+  enrichSlotsForBooking,
+} from './api';
+import { createBrowserSession, closeBrowserSession, type BrowserSession } from './browser';
 import { navigateToCalendar } from './navigation';
 import {
   loadSession,
   saveSession,
   invalidateSession,
   hasValidSession,
+  needsSessionRefresh,
+  sessionAgeMinutes,
 } from './session';
 import {
   notifySlotsFound,
@@ -19,22 +29,42 @@ import {
   registerForceCheckCallback,
   setMonitoringActive,
   recordCheckResult,
+  updateSchedulerStatus,
+  incrementBootstrapCount,
+  incrementCheckCount,
+  recordError,
 } from './telegram';
-import { isWithinWorkingHours, msUntilWorkEnd, getWorkHoursLabel } from './schedule';
+import {
+  isWithinWorkingHours,
+  msUntilWorkEnd,
+  getWorkHoursLabel,
+  getPollIntervalMs,
+  getPollModeLabel,
+  getJitterMs,
+  getMinPollDelayMs,
+  isPreBootstrapWindow,
+  isReleaseBurstWindow,
+} from './schedule';
 import { log, logError } from './logger';
 import { BROWSER_CHANNEL } from './config';
 
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS ?? '240000', 10);
-const JITTER_MS = parseInt(process.env.JITTER_MS ?? '20000', 10);
 const HEADLESS = (process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
+const BURST_KEEP_BROWSER_OPEN =
+  (process.env.BURST_KEEP_BROWSER_OPEN ?? 'true').toLowerCase() !== 'false';
 
 let isRunning = true;
 let forceCheckRequested = false;
 let wakeScheduler: (() => void) | null = null;
+let preBootstrapDone = false;
+let activeBrowserSession: BrowserSession | null = null;
 
 registerShutdownCallback(() => {
   isRunning = false;
   wakeScheduler?.();
+  void closeBrowserSession(activeBrowserSession).then(() => {
+    activeBrowserSession = null;
+  });
 });
 
 registerForceCheckCallback(() => {
@@ -56,9 +86,9 @@ function setupSignalHandlers(): void {
   });
 }
 
-function randomJitterDelay(baseMs: number, jitterMs: number): number {
+function randomJitterDelay(baseMs: number, jitterMs: number, minMs: number): number {
   const delta = Math.floor(Math.random() * (jitterMs * 2 + 1)) - jitterMs;
-  return Math.max(30_000, baseMs + delta);
+  return Math.max(minMs, baseMs + delta);
 }
 
 async function interruptibleSleep(ms: number): Promise<void> {
@@ -76,36 +106,96 @@ async function interruptibleSleep(ms: number): Promise<void> {
   });
 }
 
-async function bootstrapSession(): Promise<void> {
-  let browserSession = null;
+function shouldKeepBrowserOpen(): boolean {
+  return BURST_KEEP_BROWSER_OPEN && isReleaseBurstWindow();
+}
+
+async function bootstrapSession(keepBrowserOpen = false): Promise<void> {
+  if (activeBrowserSession) {
+    await closeBrowserSession(activeBrowserSession);
+    activeBrowserSession = null;
+  }
+
+  let browserSession: BrowserSession | null = null;
 
   try {
     log('Bootstrap: запуск браузера для получения uid/wsid...');
     browserSession = await createBrowserSession(HEADLESS);
+    incrementBootstrapCount();
 
     const result = await navigateToCalendar(browserSession.page);
     const cookies = await browserSession.context.cookies();
     const sessionData = { ...result, cookies };
 
-    saveSession(sessionData);
+    const saved = saveSession(sessionData);
+    const sessionWithAge = { ...saved, createdAt: Date.now() };
 
-    const slots = await pollSlotsFromPage(browserSession.page, {
-      ...sessionData,
-      createdAt: Date.now(),
-    });
+    const domSlots = await scrapeSlotsFromPage(browserSession.page);
+    const apiSlots = await pollSlotsWithContext(browserSession.context, sessionWithAge);
 
+    if (domSlots.length !== apiSlots.length) {
+      log(
+        `Bootstrap: DOM=${domSlots.length} слотов, API=${apiSlots.length} — ${domSlots.length > apiSlots.length ? 'API мог пропустить слоты' : 'расхождение'}`,
+      );
+    }
+
+    const slots = domSlots.length > 0 ? domSlots : apiSlots;
     log(`Bootstrap: ${slots.length > 0 ? `найдено ${slots.length} слотов` : 'свободных окон нет'}`);
+
+    if (keepBrowserOpen) {
+      activeBrowserSession = browserSession;
+      browserSession = null;
+      log('Браузер оставлен открытым для burst-опроса');
+    }
   } finally {
-    await closeBrowserSession(browserSession);
-    log('Браузер закрыт');
+    if (browserSession) {
+      await closeBrowserSession(browserSession);
+      log('Браузер закрыт');
+    }
   }
+}
+
+async function ensureFreshSession(force = false): Promise<void> {
+  const session = loadSession();
+
+  if (force || !hasValidSession() || needsSessionRefresh(session)) {
+    const reason = force
+      ? 'принудительный'
+      : !hasValidSession()
+        ? 'сессия отсутствует'
+        : `возраст ${sessionAgeMinutes(session!)} мин`;
+    log(`Re-bootstrap (${reason})`);
+    invalidateSession();
+    await bootstrapSession(shouldKeepBrowserOpen());
+  }
+}
+
+async function handlePreBootstrap(): Promise<void> {
+  if (!isPreBootstrapWindow()) {
+    preBootstrapDone = false;
+    return;
+  }
+
+  if (preBootstrapDone) return;
+
+  log('Pre-bootstrap: свежая сессия перед выбросом слотов');
+  preBootstrapDone = true;
+  invalidateSession();
+  await bootstrapSession(shouldKeepBrowserOpen());
+}
+
+async function pollWithSession(session: NonNullable<ReturnType<typeof loadSession>>) {
+  if (activeBrowserSession) {
+    return pollSlotsWithContext(activeBrowserSession.context, session);
+  }
+
+  return pollSlots(session);
 }
 
 async function runSingleCheck(): Promise<void> {
   try {
-    if (!hasValidSession()) {
-      await bootstrapSession();
-    }
+    await handlePreBootstrap();
+    await ensureFreshSession();
 
     let session = loadSession();
 
@@ -116,23 +206,27 @@ async function runSingleCheck(): Promise<void> {
     let slots;
 
     try {
-      slots = await pollSlots(session);
+      slots = await pollWithSession(session);
     } catch (error) {
-      if (error instanceof SessionExpiredError) {
-        logError('Сессия истекла', error);
+      if (error instanceof SessionExpiredError || error instanceof AmbiguousResponseError) {
+        logError('Сессия недействительна', error);
         invalidateSession();
-        await bootstrapSession();
+        await closeBrowserSession(activeBrowserSession);
+        activeBrowserSession = null;
+        await bootstrapSession(shouldKeepBrowserOpen());
         session = loadSession();
 
         if (!session) {
           throw new Error('Не удалось восстановить сессию после re-bootstrap');
         }
 
-        slots = await pollSlots(session);
+        slots = await pollWithSession(session);
       } else {
         throw error;
       }
     }
+
+    incrementCheckCount();
 
     if (slots.length > 0) {
       const bookable = enrichSlotsForBooking(slots, session);
@@ -148,7 +242,14 @@ async function runSingleCheck(): Promise<void> {
     }
   } catch (error) {
     logError('Ошибка при проверке', error);
+    recordError();
     recordCheckResult('ошибка');
+  } finally {
+    if (!shouldKeepBrowserOpen() && activeBrowserSession) {
+      await closeBrowserSession(activeBrowserSession);
+      activeBrowserSession = null;
+      log('Браузер закрыт (конец burst-окна)');
+    }
   }
 }
 
@@ -169,11 +270,20 @@ async function schedulerLoop(): Promise<void> {
       continue;
     }
 
-    const delayBefore = randomJitterDelay(CHECK_INTERVAL_MS, JITTER_MS);
+    const baseInterval = getPollIntervalMs();
+    const jitter = getJitterMs();
+    const minDelay = getMinPollDelayMs();
+    const delayBefore = randomJitterDelay(baseInterval, jitter, minDelay);
     const untilEnd = msUntilWorkEnd();
     const actualDelay = untilEnd > 0 ? Math.min(delayBefore, untilEnd) : delayBefore;
 
-    log(`Следующая проверка через ~${Math.round(actualDelay / 1000)} сек.`);
+    updateSchedulerStatus({
+      pollMode: getPollModeLabel(),
+      nextCheckSec: Math.round(actualDelay / 1000),
+      session: loadSession(),
+    });
+
+    log(`Следующая проверка через ~${Math.round(actualDelay / 1000)} сек. [${getPollModeLabel()}]`);
 
     await interruptibleSleep(actualDelay);
 
@@ -196,9 +306,10 @@ async function main(): Promise<void> {
   log('Termin-Hunter — мониторинг Zulassungsstelle Leipzig');
   log('Режим: гибрид (API search_result + Playwright bootstrap)');
   log(`Рабочие часы: ${getWorkHoursLabel()}`);
-  log(`Интервал: ~${CHECK_INTERVAL_MS / 1000} сек ± ${JITTER_MS / 1000} сек`);
+  log(`Интервал: ~${CHECK_INTERVAL_MS / 1000} сек (burst: ${getPollIntervalMs()} мс)`);
   log(`Headless: ${HEADLESS}`);
   log(`Браузер: ${BROWSER_CHANNEL ?? 'chromium (playwright)'}`);
+  log(`Burst browser: ${BURST_KEEP_BROWSER_OPEN ? 'да' : 'нет'}`);
   log('═'.repeat(50));
 
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
@@ -216,6 +327,9 @@ async function main(): Promise<void> {
 
   await runSingleCheck();
   await schedulerLoop();
+
+  await closeBrowserSession(activeBrowserSession);
+  activeBrowserSession = null;
 
   log('Termin-Hunter остановлен');
 }
