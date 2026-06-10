@@ -5,7 +5,7 @@
  */
 
 import { BROWSER_TIMEZONE } from './config';
-import { env } from './env';
+import { env, isMonitor24_7 } from './env';
 
 const WORK_START = env.WORK_HOURS_START;
 const WORK_END = env.WORK_HOURS_END;
@@ -162,10 +162,16 @@ export function isReleaseDayToday(): boolean {
 }
 
 export function getWorkHoursLabel(): string {
+  if (isMonitor24_7()) {
+    return `круглосуточно (${BROWSER_TIMEZONE})`;
+  }
+
   return `${WORK_START}–${WORK_END} (${BROWSER_TIMEZONE})`;
 }
 
 export function isWithinWorkingHours(): boolean {
+  if (isMonitor24_7()) return true;
+
   const { totalMinutes } = getBerlinDateTime();
   const start = parseTimeToMinutes(WORK_START);
   const end = parseTimeToMinutes(WORK_END);
@@ -173,8 +179,10 @@ export function isWithinWorkingHours(): boolean {
   return totalMinutes >= start && totalMinutes < end;
 }
 
-/** Миллисекунды до конца рабочего окна */
+/** Миллисекунды до конца рабочего окна (0 = без ограничения при 24/7) */
 export function msUntilWorkEnd(): number {
+  if (isMonitor24_7()) return 0;
+
   const { totalMinutes, second } = getBerlinDateTime();
   const end = parseTimeToMinutes(WORK_END);
   const minutesLeft = end - totalMinutes;

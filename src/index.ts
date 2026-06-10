@@ -11,7 +11,7 @@ import {
   AmbiguousResponseError,
   enrichSlotsForBooking,
 } from './api';
-import { env } from './env';
+import { env, isMonitor24_7 } from './env';
 import { RateLimitError, getRateLimitDelayMs } from './rate-limit';
 import { createBrowserSession, closeBrowserSession, type BrowserSession } from './browser';
 import { navigateToCalendar } from './navigation';
@@ -119,6 +119,13 @@ async function interruptibleSleep(ms: number): Promise<void> {
 
 function shouldKeepBrowserOpen(): boolean {
   return BURST_KEEP_BROWSER_OPEN && isReleaseBurstWindow();
+}
+
+function stopAfterSuccessfulBook(): void {
+  log('Termin забронирован — останавливаю агент');
+  isRunning = false;
+  setMonitoringActive(false);
+  wakeScheduler?.();
 }
 
 async function bootstrapWithPlaywright(keepBrowserOpen = false): Promise<void> {
@@ -319,6 +326,15 @@ async function runSingleCheck(): Promise<string> {
       await sendExtraSlotAlerts(bookable, session, booked);
       await notifySlotsFound(bookable, session, booked);
       recordCheckResult(booked ? `забронировано / найдено ${slots.length}` : `найдено ${slots.length} слотов`);
+
+      if (
+        booked
+        && env.AUTO_BOOK_STOP_ON_SUCCESS
+        && !env.AUTO_BOOK_DRY_RUN
+      ) {
+        stopAfterSuccessfulBook();
+      }
+
       return booked ? `забронировано: ${bookable[0].date_time}` : `найдено ${slots.length} слотов`;
     }
 
@@ -394,7 +410,7 @@ async function main(): Promise<void> {
   log('═'.repeat(50));
   log('Termin-Hunter — мониторинг Zulassungsstelle Leipzig');
   log(`Режим: гибрид (bootstrap=${BOOTSTRAP_MODE}, auto-book=${isAutoBookEnabled()})`);
-  log(`Рабочие часы: ${getWorkHoursLabel()}`);
+  log(`Мониторинг: ${getWorkHoursLabel()}${isMonitor24_7() ? ' · стоп после брони' : ''}`);
   log(`Интервал: ~${CHECK_INTERVAL_MS / 1000} сек (burst: ${getPollIntervalMs()} мс)`);
   log(`Headless: ${HEADLESS}`);
   log(`Браузер: ${env.BROWSER_CHANNEL ?? 'chromium (playwright)'}`);
@@ -407,7 +423,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (!isWithinWorkingHours()) {
+  if (!isMonitor24_7() && !isWithinWorkingHours()) {
     log(`Сейчас вне рабочих часов (${getWorkHoursLabel()}). Выход.`);
     process.exit(0);
   }

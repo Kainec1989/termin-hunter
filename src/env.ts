@@ -56,6 +56,8 @@ export const env = {
   AUTO_BOOK: parseBoolEnv('AUTO_BOOK', false),
   AUTO_BOOK_DRY_RUN: parseBoolEnv('AUTO_BOOK_DRY_RUN', false),
   BOOKING_EMAIL: process.env.BOOKING_EMAIL?.trim() ?? '',
+  /** Остановить агент после успешного auto-book */
+  AUTO_BOOK_STOP_ON_SUCCESS: parseBoolEnv('AUTO_BOOK_STOP_ON_SUCCESS', true),
 
   NTFY_TOPIC: process.env.NTFY_TOPIC?.trim(),
   NTFY_SERVER: (process.env.NTFY_SERVER ?? 'https://ntfy.sh').replace(/\/$/, ''),
@@ -66,6 +68,15 @@ export const env = {
 
   RATE_LIMIT_BACKOFF_MS: parseIntEnv('RATE_LIMIT_BACKOFF_MS', '300000'),
 } as const;
+
+/** Круглосуточный мониторинг: явный MONITOR_24_7 или auto-book включён */
+export function isMonitor24_7(): boolean {
+  if (process.env.MONITOR_24_7 !== undefined) {
+    return parseBoolEnv('MONITOR_24_7', false);
+  }
+
+  return env.AUTO_BOOK && env.BOOKING_EMAIL.length > 0;
+}
 
 if (env.AUTO_BOOK && !env.BOOKING_EMAIL) {
   console.warn('[env] AUTO_BOOK=true, но BOOKING_EMAIL не задан — auto-book отключён');
