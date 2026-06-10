@@ -7,7 +7,8 @@
     "start": "ts-node src/index.ts",
     "dev": "ts-node src/index.ts",
     "build": "tsc",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --require ts-node/register --test 'src/__tests__/**/*.test.ts'"
   },
   "keywords": [
     "leipzig",

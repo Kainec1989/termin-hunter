@@ -17,7 +17,7 @@ export const BOOKING_BASE_URL =
 export const API_BASE_URL =
   'https://terminvereinbarung.leipzig.de/m/leipzig-kfz/extern/calendar';
 
-/** Режимы поиска слотов (опрашиваются последовательно, результаты объединяются) */
+/** Режимы поиска слотов (опрашиваются параллельно, результаты объединяются) */
 export const API_SEARCH_MODES = ['earliest', 'all'] as const;
 
 /** Реальный User-Agent современного Chrome под Linux — снижает вероятность детекта бота */

@@ -7,16 +7,17 @@ import { promisify } from 'util';
 import type { ApiSlot } from './api';
 import type { SmartCxSession } from './session';
 import { enrichBookingLink } from './api';
+import { env } from './env';
 import { log, logError } from './logger';
 
 const execFileAsync = promisify(execFile);
 
-const NTFY_TOPIC = process.env.NTFY_TOPIC?.trim();
-const NTFY_SERVER = (process.env.NTFY_SERVER ?? 'https://ntfy.sh').replace(/\/$/, '');
-const PUSHOVER_USER_KEY = process.env.PUSHOVER_USER_KEY?.trim();
-const PUSHOVER_API_TOKEN = process.env.PUSHOVER_API_TOKEN?.trim();
-const TTS_ON_SLOT = (process.env.TTS_ON_SLOT ?? 'false').toLowerCase() === 'true';
-const TTS_COMMAND = process.env.TTS_COMMAND ?? 'spd-say';
+const NTFY_TOPIC = env.NTFY_TOPIC;
+const NTFY_SERVER = env.NTFY_SERVER;
+const PUSHOVER_USER_KEY = env.PUSHOVER_USER_KEY;
+const PUSHOVER_API_TOKEN = env.PUSHOVER_API_TOKEN;
+const TTS_ON_SLOT = env.TTS_ON_SLOT;
+const TTS_COMMAND = env.TTS_COMMAND;
 
 export function hasExtraAlerts(): boolean {
   return !!(NTFY_TOPIC || (PUSHOVER_USER_KEY && PUSHOVER_API_TOKEN) || TTS_ON_SLOT);

@@ -8,6 +8,7 @@ import { getLastPollDiagnostics } from './api';
 import type { SmartCxSession } from './session';
 import { sessionAgeMinutes, SESSION_TTL_MS, SESSION_REFRESH_MS } from './session';
 import { enrichBookingLink, getCalendarUrl } from './api';
+import { loadNotifiedKeys, markSlotsNotified } from './notified-slots';
 import { getBerlinTimeString, getWorkHoursLabel, isWithinWorkingHours } from './schedule';
 import { log, logError } from './logger';
 
@@ -25,7 +26,7 @@ let bootstrapCount = 0;
 let checkCount = 0;
 let errorCount = 0;
 
-const sentSlotKeys = new Set<string>();
+const sentSlotKeys = loadNotifiedKeys();
 
 function getBot(): Telegraf {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -319,9 +320,7 @@ export async function notifySlotsFound(
     link_preview_options: { is_disabled: false },
   });
 
-  for (const slot of newSlots) {
-    sentSlotKeys.add(slotKey(slot));
-  }
+  markSlotsNotified(newSlots.map(slotKey), sentSlotKeys);
 
   log(`Telegram: отправлено уведомление о ${newSlots.length} новом слот(ах)`);
 }

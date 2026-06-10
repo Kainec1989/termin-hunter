@@ -5,18 +5,19 @@
  */
 
 import { BROWSER_TIMEZONE } from './config';
+import { env } from './env';
 
-const WORK_START = process.env.WORK_HOURS_START ?? '07:00';
-const WORK_END = process.env.WORK_HOURS_END ?? '19:00';
+const WORK_START = env.WORK_HOURS_START;
+const WORK_END = env.WORK_HOURS_END;
 
-const BURST_INTERVAL_MS = parseInt(process.env.BURST_INTERVAL_MS ?? '30000', 10);
-/** Агрессивный burst (leipzigappointmentsbot): опрос каждую минуту */
-const BURST_AGGRESSIVE_INTERVAL_MS = parseInt(process.env.BURST_AGGRESSIVE_INTERVAL_MS ?? '60000', 10);
-const BURST_AGGRESSIVE = (process.env.BURST_AGGRESSIVE ?? 'true').toLowerCase() !== 'false';
-const PRE_RELEASE_INTERVAL_MS = parseInt(process.env.PRE_RELEASE_INTERVAL_MS ?? '60000', 10);
-const BURST_WINDOW_MINUTES = parseInt(process.env.BURST_WINDOW_MINUTES ?? '45', 10);
-const PRE_RELEASE_MINUTES = parseInt(process.env.PRE_RELEASE_MINUTES ?? '5', 10);
-const PRE_BOOTSTRAP_MINUTES = parseInt(process.env.PRE_BOOTSTRAP_MINUTES ?? '2', 10);
+const BURST_INTERVAL_MS = env.BURST_INTERVAL_MS;
+/** Агрессивный burst (smartcjm-sniper): опрос каждые ~30 сек */
+const BURST_AGGRESSIVE_INTERVAL_MS = env.BURST_AGGRESSIVE_INTERVAL_MS;
+const BURST_AGGRESSIVE = env.BURST_AGGRESSIVE;
+const PRE_RELEASE_INTERVAL_MS = env.PRE_RELEASE_INTERVAL_MS;
+const BURST_WINDOW_MINUTES = env.BURST_WINDOW_MINUTES;
+const PRE_RELEASE_MINUTES = env.PRE_RELEASE_MINUTES;
+const PRE_BOOTSTRAP_MINUTES = env.PRE_BOOTSTRAP_MINUTES;
 
 export type PollMode = 'burst' | 'pre_release' | 'normal';
 
@@ -131,7 +132,7 @@ export function getPollMode(): PollMode {
 export function getPollModeLabel(): string {
   const mode = getPollMode();
   if (mode === 'burst') {
-    return BURST_AGGRESSIVE ? 'burst агрессивный (~1 мин)' : 'burst (выброс слотов)';
+    return BURST_AGGRESSIVE ? 'burst агрессивный (~30 сек)' : 'burst (выброс слотов)';
   }
   if (mode === 'pre_release') return 'pre-release (скоро выброс)';
   return 'обычный';
@@ -143,17 +144,17 @@ export function getPollIntervalMs(): number {
   if (mode === 'burst') return BURST_AGGRESSIVE ? BURST_AGGRESSIVE_INTERVAL_MS : BURST_INTERVAL_MS;
   if (mode === 'pre_release') return PRE_RELEASE_INTERVAL_MS;
 
-  return parseInt(process.env.CHECK_INTERVAL_MS ?? '240000', 10);
+  return env.CHECK_INTERVAL_MS;
 }
 
 export function getMinPollDelayMs(): number {
-  return getPollMode() === 'burst' ? 15_000 : 30_000;
+  return getPollMode() === 'burst' ? 10_000 : 30_000;
 }
 
 export function getJitterMs(): number {
   const mode = getPollMode();
-  if (mode === 'burst') return parseInt(process.env.BURST_JITTER_MS ?? '5000', 10);
-  return parseInt(process.env.JITTER_MS ?? '20000', 10);
+  if (mode === 'burst') return env.BURST_JITTER_MS;
+  return env.JITTER_MS;
 }
 
 export function isReleaseDayToday(): boolean {

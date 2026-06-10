@@ -42,5 +42,6 @@ export function log(message: string): void {
 
 export function logError(message: string, error?: unknown): void {
   const detail = error instanceof Error ? error.message : String(error ?? '');
-  writeLine('ОШИБКА', `${message}${detail ? ` — ${detail}` : ''}`);
+  const stack = error instanceof Error && error.stack ? `\n${error.stack}` : '';
+  writeLine('ОШИБКА', `${message}${detail ? ` — ${detail}` : ''}${stack}`);
 }

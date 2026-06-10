@@ -3,4 +3,6 @@ dist/
 .env
 .session.json
 .last-check.json
+.last-booking.json
+.notified-slots.json
 *.log

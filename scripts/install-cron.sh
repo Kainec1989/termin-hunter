@@ -15,9 +15,9 @@ NPM_BIN="$(command -v npm)"
 STDBUF_BIN="$(command -v stdbuf || true)"
 
 if [[ -n "${STDBUF_BIN}" ]]; then
-  RUN_CMD="${STDBUF_BIN} -oL ${NPM_BIN} start"
+  RUN_CMD="${STDBUF_BIN} -oL bash -c 'npm run build && node dist/index.js'"
 else
-  RUN_CMD="${NPM_BIN} start"
+  RUN_CMD="bash -c 'npm run build && node dist/index.js'"
 fi
 
 CRON_DAILY="0 7 * * * cd ${PROJECT_DIR} && flock -n ${LOCK_FILE} ${RUN_CMD} >> ${LOG_FILE} 2>&1"

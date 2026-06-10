@@ -5,13 +5,14 @@
 import 'dotenv/config';
 import {
   pollSlots,
-  pollSlotsFromPage,
   pollSlotsWithContext,
   scrapeSlotsFromPage,
   SessionExpiredError,
   AmbiguousResponseError,
   enrichSlotsForBooking,
 } from './api';
+import { env } from './env';
+import { RateLimitError, getRateLimitDelayMs } from './rate-limit';
 import { createBrowserSession, closeBrowserSession, type BrowserSession } from './browser';
 import { navigateToCalendar } from './navigation';
 import { httpBootstrap, refreshWsidOnly } from './http-bootstrap';
@@ -50,14 +51,12 @@ import {
   isReleaseBurstWindow,
 } from './schedule';
 import { log, logError } from './logger';
-import { BROWSER_CHANNEL } from './config';
 
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS ?? '240000', 10);
-const HEADLESS = (process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
-const BURST_KEEP_BROWSER_OPEN =
-  (process.env.BURST_KEEP_BROWSER_OPEN ?? 'true').toLowerCase() !== 'false';
-const BOOTSTRAP_MODE = (process.env.BOOTSTRAP_MODE ?? 'http').toLowerCase();
-const WSID_REFRESH_ONLY = (process.env.WSID_REFRESH_ONLY ?? 'true').toLowerCase() !== 'false';
+const CHECK_INTERVAL_MS = env.CHECK_INTERVAL_MS;
+const HEADLESS = env.HEADLESS;
+const BURST_KEEP_BROWSER_OPEN = env.BURST_KEEP_BROWSER_OPEN;
+const BOOTSTRAP_MODE = env.BOOTSTRAP_MODE;
+const WSID_REFRESH_ONLY = env.WSID_REFRESH_ONLY;
 
 let isRunning = true;
 let wakeScheduler: (() => void) | null = null;
@@ -264,6 +263,10 @@ async function runSingleCheck(): Promise<string> {
     try {
       slots = await pollWithSession(session);
     } catch (error) {
+      if (error instanceof RateLimitError) {
+        throw error;
+      }
+
       if (error instanceof SessionExpiredError || error instanceof AmbiguousResponseError) {
         logError('Сессия недействительна', error);
         const refreshed = session ? await tryLightWsidRefresh(session) : false;
@@ -323,6 +326,11 @@ async function runSingleCheck(): Promise<string> {
     recordCheckResult('свободных окон нет');
     return 'свободных окон нет';
   } catch (error) {
+    if (error instanceof RateLimitError) {
+      recordCheckResult('rate limit 429');
+      return 'rate limit — пауза опроса';
+    }
+
     logError('Ошибка при проверке', error);
     recordError();
     recordCheckResult('ошибка');
@@ -342,6 +350,13 @@ async function schedulerLoop(): Promise<void> {
       log(`Вне рабочих часов (${getWorkHoursLabel()}) — завершение на сегодня`);
       setMonitoringActive(false);
       break;
+    }
+
+    const rateLimitDelay = getRateLimitDelayMs();
+    if (rateLimitDelay > 0) {
+      log(`Rate limit: пауза ~${Math.round(rateLimitDelay / 1000)} сек перед опросом`);
+      await interruptibleSleep(rateLimitDelay);
+      if (!isRunning) break;
     }
 
     const baseInterval = getPollIntervalMs();
@@ -382,12 +397,12 @@ async function main(): Promise<void> {
   log(`Рабочие часы: ${getWorkHoursLabel()}`);
   log(`Интервал: ~${CHECK_INTERVAL_MS / 1000} сек (burst: ${getPollIntervalMs()} мс)`);
   log(`Headless: ${HEADLESS}`);
-  log(`Браузер: ${BROWSER_CHANNEL ?? 'chromium (playwright)'}`);
+  log(`Браузер: ${env.BROWSER_CHANNEL ?? 'chromium (playwright)'}`);
   log(`Burst browser: ${BURST_KEEP_BROWSER_OPEN ? 'да' : 'нет'}`);
   log(`Wsid refresh: ${WSID_REFRESH_ONLY ? 'redirect' : 'полный bootstrap'}`);
   log('═'.repeat(50));
 
-  if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     logError('Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в файле .env');
     process.exit(1);
   }

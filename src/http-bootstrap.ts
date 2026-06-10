@@ -9,8 +9,10 @@ import {
   TEXT_SERVICE_VEHICLE_CORRECTION,
   USER_AGENT,
 } from './config';
+import { fetchWithRetry } from './fetch-retry';
 import { log } from './logger';
 import type { SmartCxSession } from './session';
+import { extractCsrf, isSessionExpiredHtml } from './smart-cx-utils';
 
 export class HttpBootstrapError extends Error {
   constructor(message: string) {
@@ -122,7 +124,7 @@ async function fetchWithJar(
   const cookie = jar.header();
   if (cookie) headers.Cookie = cookie;
 
-  const response = await fetch(url, { ...init, headers });
+  const response = await fetchWithRetry(url, { ...init, headers });
   jar.absorb(response, url);
   return response;
 }
@@ -133,30 +135,6 @@ function extractWsidFromUrl(url: string): string | null {
   } catch {
     return null;
   }
-}
-
-function extractCsrf(html: string): { name: string; value: string } | null {
-  const match = html.match(
-    /<input[^>]*id=["']RequestVerificationToken["'][^>]*name=["']([^"']+)["'][^>]*value=["']([^"']+)["'][^>]*>/i,
-  );
-
-  if (match) return { name: match[1], value: match[2] };
-
-  const alt = html.match(
-    /<input[^>]*name=["']([^"']+)["'][^>]*id=["']RequestVerificationToken["'][^>]*value=["']([^"']+)["'][^>]*>/i,
-  );
-
-  if (alt) return { name: alt[1], value: alt[2] };
-
-  return null;
-}
-
-/** Не путать с JS-конфигом url_expired: "session_expired?uid=..." на живой странице */
-function isSessionExpiredHtml(html: string): boolean {
-  if (/Ihre Sitzung ist abgelaufen/i.test(html)) return true;
-  if (/id=["']step_session_expired["']/i.test(html)) return true;
-  if (/Object moved/i.test(html) && !/RequestVerificationToken|services-list/i.test(html)) return true;
-  return false;
 }
 
 interface ServiceEntry {

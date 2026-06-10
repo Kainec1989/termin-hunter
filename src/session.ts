@@ -5,6 +5,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import type { Cookie } from 'playwright';
+import { env } from './env';
 import { log } from './logger';
 
 export interface SmartCxSession {
@@ -22,8 +23,8 @@ const SESSION_FILE = join(process.cwd(), '.session.json');
 
 let currentSession: SmartCxSession | null = null;
 
-export const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS ?? '900000', 10);
-export const SESSION_REFRESH_MS = parseInt(process.env.SESSION_REFRESH_MS ?? '720000', 10);
+export const SESSION_TTL_MS = env.SESSION_TTL_MS;
+export const SESSION_REFRESH_MS = env.SESSION_REFRESH_MS;
 
 export function parseSessionFromUrl(url: string): Pick<SmartCxSession, 'uid' | 'wsid' | 'bookingUrl'> | null {
   try {

@@ -9,7 +9,15 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Page } from 'playwright';
 import { API_BASE_URL, API_SEARCH_MODES, USER_AGENT } from './config';
+import { fetchWithRetry } from './fetch-retry';
 import { buildCookieHeader, getApiUid, type SmartCxSession } from './session';
+import {
+  hasJsonAppointmentList,
+  isAmbiguousHtml,
+  isNoSlotsHtml,
+  isSessionExpiredHtml,
+} from './smart-cx-utils';
+import { applyRateLimitBackoff, RateLimitError } from './rate-limit';
 import { log } from './logger';
 
 export interface ApiSlot {
@@ -209,35 +217,7 @@ function parseSlotsFromText(text: string): ApiSlot[] {
   return slots;
 }
 
-function isSessionExpiredHtml(html: string): boolean {
-  if (/Ihre Sitzung ist abgelaufen/i.test(html)) return true;
-  if (/id=["']step_session_expired["']/i.test(html)) return true;
-  if (/Keine freien Termine|json_appointment_list|services-list|step_search_results/i.test(html)) {
-    return false;
-  }
-  if (/Object moved/i.test(html)) return true;
-  return false;
-}
-
-function isNoSlotsHtml(html: string): boolean {
-  return /Keine freien Termine gefunden|nothing_Found|nothing_found/i.test(html);
-}
-
-function hasJsonAppointmentList(html: string): boolean {
-  return /id=["']json_appointment_list["']/i.test(html);
-}
-
-function isAmbiguousHtml(html: string): boolean {
-  if (!html.trim()) return true;
-  if (isSessionExpiredHtml(html)) return false;
-  if (isNoSlotsHtml(html)) return false;
-  if (hasJsonAppointmentList(html)) return false;
-  if (parseSlotsFromText(html).length > 0) return false;
-
-  return true;
-}
-
-interface HtmlParseResult {
+export interface HtmlParseResult {
   slots: ApiSlot[];
   no_slots: boolean;
   session_expired: boolean;
@@ -246,7 +226,7 @@ interface HtmlParseResult {
 }
 
 /** Парсит HTML-ответ search_result (основной формат Smart CX) */
-function parseSlotsFromHtml(html: string, throwOnAmbiguous = true): HtmlParseResult {
+export function parseSlotsFromHtml(html: string, throwOnAmbiguous = true): HtmlParseResult {
   if (isSessionExpiredHtml(html)) {
     throw new SessionExpiredError('Сессия wsid истекла (session_expired)');
   }
@@ -388,7 +368,7 @@ async function fetchSearchResult(
     headers.Cookie = cookieHeader;
   }
 
-  const response = await fetch(url, { headers });
+  const response = await fetchWithRetry(url, { headers });
   const body = await response.text();
 
   if (response.status === 401 || response.status === 403) {
@@ -449,10 +429,11 @@ export async function pollSlots(session: SmartCxSession): Promise<ApiSlot[]> {
     ambiguous: false,
   };
 
-  log(`API-опрос: ${modes.join(' + ')} (uid=${getApiUid(session).slice(0, 8)}…)`);
+  log(`API-опрос: ${modes.join(' + ')} parallel (uid=${getApiUid(session).slice(0, 8)}…)`);
 
-  for (const mode of modes) {
-    const { body, status, parse } = await fetchSearchResult(session, mode);
+  const results = await Promise.all(modes.map((mode) => fetchSearchResult(session, mode)));
+
+  for (const { body, status, parse } of results) {
     lastBody = body;
     lastStatus = status;
     lastFlags = {
@@ -489,28 +470,39 @@ export async function pollSlotsWithContext(
     ambiguous: false,
   };
 
-  log(`API-опрос (browser): ${modes.join(' + ')} (uid=${getApiUid(session).slice(0, 8)}…)`);
+  log(`API-опрос (browser): ${modes.join(' + ')} parallel (uid=${getApiUid(session).slice(0, 8)}…)`);
 
-  for (const mode of modes) {
-    const url = buildSearchUrl(session, mode);
+  const results = await Promise.all(
+    modes.map(async (mode) => {
+      const url = buildSearchUrl(session, mode);
 
-    const response = await context.request.get(url, {
-      headers: {
-        Accept: 'text/html, application/json, */*',
-        'Accept-Language': 'de-DE,de;q=0.9',
-        Referer: session.bookingUrl,
-      },
-    });
+      const response = await context.request.get(url, {
+        headers: {
+          Accept: 'text/html, application/json, */*',
+          'Accept-Language': 'de-DE,de;q=0.9',
+          Referer: session.bookingUrl,
+        },
+      });
 
-    if ([401, 403].includes(response.status())) {
-      throw new SessionExpiredError(`HTTP ${response.status()}: сессия wsid истекла`);
-    }
+      if ([401, 403].includes(response.status())) {
+        throw new SessionExpiredError(`HTTP ${response.status()}: сессия wsid истекла`);
+      }
 
-    const body = await response.text();
-    const parse = parseResponseBody(body);
+      if (response.status() === 429) {
+        applyRateLimitBackoff();
+        throw new RateLimitError();
+      }
 
+      const body = await response.text();
+      const parse = parseResponseBody(body);
+
+      return { body, status: response.status(), parse };
+    }),
+  );
+
+  for (const { body, status, parse } of results) {
     lastBody = body;
-    lastStatus = response.status();
+    lastStatus = status;
     lastFlags = {
       no_slots: parse.no_slots,
       session_expired: parse.session_expired,

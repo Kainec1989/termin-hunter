@@ -2,10 +2,15 @@
  * Авто-бронирование слота через Smart CX /booking (паттерн smartcjm-appointment-sniper).
  */
 
+import { writeFileSync } from 'fs';
+import { join } from 'path';
 import { API_BASE_URL, USER_AGENT } from './config';
+import { env } from './env';
+import { fetchWithRetry } from './fetch-retry';
 import { log, logError } from './logger';
 import type { ApiSlot } from './api';
 import { buildCookieHeader, getApiUid, type SmartCxSession } from './session';
+import { extractCsrf, isBookingSuccessHtml } from './smart-cx-utils';
 
 export class BookingError extends Error {
   constructor(message: string) {
@@ -14,26 +19,27 @@ export class BookingError extends Error {
   }
 }
 
-const AUTO_BOOK = (process.env.AUTO_BOOK ?? 'false').toLowerCase() === 'true';
-const BOOKING_EMAIL = process.env.BOOKING_EMAIL?.trim() ?? '';
-const AUTO_BOOK_DRY_RUN = (process.env.AUTO_BOOK_DRY_RUN ?? 'false').toLowerCase() === 'true';
+const LAST_BOOKING_FILE = join(process.cwd(), '.last-booking.json');
 
-export function isAutoBookEnabled(): boolean {
-  return AUTO_BOOK && BOOKING_EMAIL.length > 0;
+export interface LastBookingRecord {
+  timestamp: string;
+  slot: string;
+  success: boolean;
+  finalUrl?: string;
+  reason?: string;
+  responsePreview: string;
 }
 
-function extractCsrf(html: string): { name: string; value: string } | null {
-  const match = html.match(
-    /<input[^>]*id=["']RequestVerificationToken["'][^>]*name=["']([^"']+)["'][^>]*value=["']([^"']+)["'][^>]*>/i,
-  );
-  if (match) return { name: match[1], value: match[2] };
+export function isAutoBookEnabled(): boolean {
+  return env.AUTO_BOOK && env.BOOKING_EMAIL.length > 0;
+}
 
-  const alt = html.match(
-    /<input[^>]*name=["']([^"']+)["'][^>]*id=["']RequestVerificationToken["'][^>]*value=["']([^"']+)["'][^>]*>/i,
-  );
-  if (alt) return { name: alt[1], value: alt[2] };
-
-  return null;
+function saveLastBooking(record: LastBookingRecord): void {
+  try {
+    writeFileSync(LAST_BOOKING_FILE, JSON.stringify(record, null, 2), 'utf-8');
+  } catch {
+    // ignore
+  }
 }
 
 function parseIsoFromSlot(slot: ApiSlot): string | null {
@@ -65,6 +71,13 @@ export async function tryAutoBook(slot: ApiSlot, session: SmartCxSession): Promi
 
   if (!appointmentDatetime || !location) {
     logError('Auto-book: не удалось извлечь datetime/location из слота', slot.link);
+    saveLastBooking({
+      timestamp: new Date().toISOString(),
+      slot: slot.date_time,
+      success: false,
+      reason: 'missing datetime/location',
+      responsePreview: slot.link,
+    });
     return false;
   }
 
@@ -89,31 +102,56 @@ export async function tryAutoBook(slot: ApiSlot, session: SmartCxSession): Promi
 
   if (cookieHeader) headers.Cookie = cookieHeader;
 
-  if (AUTO_BOOK_DRY_RUN) {
+  if (env.AUTO_BOOK_DRY_RUN) {
     log(`Auto-book DRY-RUN: ${slot.date_time} → ${bookingUrl}`);
+    saveLastBooking({
+      timestamp: new Date().toISOString(),
+      slot: slot.date_time,
+      success: true,
+      finalUrl: bookingUrl,
+      reason: 'dry-run',
+      responsePreview: '',
+    });
     return true;
   }
 
   log(`Auto-book: бронирование ${slot.date_time}…`);
 
-  const getRes = await fetch(bookingUrl, { headers });
+  const getRes = await fetchWithRetry(bookingUrl, { headers });
 
   if (!getRes.ok) {
-    throw new BookingError(`GET booking HTTP ${getRes.status}`);
+    const err = new BookingError(`GET booking HTTP ${getRes.status}`);
+    saveLastBooking({
+      timestamp: new Date().toISOString(),
+      slot: slot.date_time,
+      success: false,
+      reason: err.message,
+      responsePreview: '',
+    });
+    throw err;
   }
 
   const html = await getRes.text();
   const csrf = extractCsrf(html);
 
   if (!csrf) {
-    throw new BookingError('CSRF token не найден на странице booking');
+    const err = new BookingError('CSRF token не найден на странице booking');
+    saveLastBooking({
+      timestamp: new Date().toISOString(),
+      slot: slot.date_time,
+      success: false,
+      finalUrl: getRes.url,
+      reason: err.message,
+      responsePreview: html.slice(0, 200),
+    });
+    throw err;
   }
 
   const formBody = new URLSearchParams();
   formBody.set(csrf.name, csrf.value);
-  formBody.set('mail', BOOKING_EMAIL);
+  formBody.set('mail', env.BOOKING_EMAIL);
 
-  const postRes = await fetch(bookingUrl, {
+  const postRes = await fetchWithRetry(bookingUrl, {
     method: 'POST',
     headers: {
       ...headers,
@@ -124,15 +162,35 @@ export async function tryAutoBook(slot: ApiSlot, session: SmartCxSession): Promi
   });
 
   if (!postRes.ok && postRes.status !== 302) {
-    throw new BookingError(`POST booking HTTP ${postRes.status}`);
+    const err = new BookingError(`POST booking HTTP ${postRes.status}`);
+    saveLastBooking({
+      timestamp: new Date().toISOString(),
+      slot: slot.date_time,
+      success: false,
+      finalUrl: postRes.url,
+      reason: err.message,
+      responsePreview: '',
+    });
+    throw err;
   }
 
   const resultHtml = await postRes.text();
+  const finalUrl = postRes.url;
+  const success = isBookingSuccessHtml(resultHtml, finalUrl);
 
-  if (/session_expired|fehlgeschlagen|error/i.test(resultHtml) && !/erfolg|bestätig|confirmation/i.test(resultHtml)) {
+  saveLastBooking({
+    timestamp: new Date().toISOString(),
+    slot: slot.date_time,
+    success,
+    finalUrl,
+    reason: success ? 'confirmed' : 'rejected by server',
+    responsePreview: resultHtml.slice(0, 200),
+  });
+
+  if (!success) {
     throw new BookingError('Бронирование отклонено сервером');
   }
 
-  log(`Auto-book: запрос отправлен для ${slot.date_time} (${BOOKING_EMAIL})`);
+  log(`Auto-book: успех для ${slot.date_time} (${env.BOOKING_EMAIL})`);
   return true;
 }
