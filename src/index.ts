@@ -14,6 +14,9 @@ import {
 } from './api';
 import { createBrowserSession, closeBrowserSession, type BrowserSession } from './browser';
 import { navigateToCalendar } from './navigation';
+import { httpBootstrap, refreshWsidOnly } from './http-bootstrap';
+import { tryAutoBook, isAutoBookEnabled, BookingError } from './booking';
+import { sendExtraSlotAlerts } from './alerts';
 import {
   loadSession,
   saveSession,
@@ -21,6 +24,7 @@ import {
   hasValidSession,
   needsSessionRefresh,
   sessionAgeMinutes,
+  type SmartCxSession,
 } from './session';
 import {
   notifySlotsFound,
@@ -52,6 +56,8 @@ const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS ?? '240000', 10
 const HEADLESS = (process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
 const BURST_KEEP_BROWSER_OPEN =
   (process.env.BURST_KEEP_BROWSER_OPEN ?? 'true').toLowerCase() !== 'false';
+const BOOTSTRAP_MODE = (process.env.BOOTSTRAP_MODE ?? 'http').toLowerCase();
+const WSID_REFRESH_ONLY = (process.env.WSID_REFRESH_ONLY ?? 'true').toLowerCase() !== 'false';
 
 let isRunning = true;
 let wakeScheduler: (() => void) | null = null;
@@ -116,18 +122,12 @@ function shouldKeepBrowserOpen(): boolean {
   return BURST_KEEP_BROWSER_OPEN && isReleaseBurstWindow();
 }
 
-async function bootstrapSession(keepBrowserOpen = false): Promise<void> {
-  if (activeBrowserSession) {
-    await closeBrowserSession(activeBrowserSession);
-    activeBrowserSession = null;
-  }
-
+async function bootstrapWithPlaywright(keepBrowserOpen = false): Promise<void> {
   let browserSession: BrowserSession | null = null;
 
   try {
-    log('Bootstrap: запуск браузера для получения uid/wsid...');
+    log('Bootstrap (Playwright): запуск браузера…');
     browserSession = await createBrowserSession(HEADLESS);
-    incrementBootstrapCount();
 
     const result = await navigateToCalendar(browserSession.page);
     const cookies = await browserSession.context.cookies();
@@ -141,7 +141,7 @@ async function bootstrapSession(keepBrowserOpen = false): Promise<void> {
 
     if (domSlots.length !== apiSlots.length) {
       log(
-        `Bootstrap: DOM=${domSlots.length} слотов, API=${apiSlots.length} — ${domSlots.length > apiSlots.length ? 'API мог пропустить слоты' : 'расхождение'}`,
+        `Bootstrap: DOM=${domSlots.length} слотов, API=${apiSlots.length} — расхождение`,
       );
     }
 
@@ -161,6 +161,49 @@ async function bootstrapSession(keepBrowserOpen = false): Promise<void> {
   }
 }
 
+async function bootstrapWithHttp(): Promise<void> {
+  const sessionData = await httpBootstrap();
+  saveSession(sessionData);
+
+  const slots = await pollSlots({ ...sessionData, createdAt: Date.now() });
+  log(`HTTP bootstrap: ${slots.length > 0 ? `найдено ${slots.length} слотов` : 'свободных окон нет'}`);
+}
+
+async function bootstrapSession(keepBrowserOpen = false): Promise<void> {
+  if (activeBrowserSession) {
+    await closeBrowserSession(activeBrowserSession);
+    activeBrowserSession = null;
+  }
+
+  incrementBootstrapCount();
+
+  if (BOOTSTRAP_MODE === 'playwright') {
+    await bootstrapWithPlaywright(keepBrowserOpen);
+    return;
+  }
+
+  try {
+    await bootstrapWithHttp();
+  } catch (error) {
+    logError('HTTP bootstrap не удался — fallback на Playwright', error);
+    await bootstrapWithPlaywright(keepBrowserOpen);
+  }
+}
+
+async function tryLightWsidRefresh(session: SmartCxSession): Promise<boolean> {
+  if (!WSID_REFRESH_ONLY) return false;
+
+  try {
+    const refreshed = await refreshWsidOnly(session);
+    saveSession(refreshed);
+    log('Лёгкое обновление wsid через redirect успешно');
+    return true;
+  } catch (error) {
+    logError('Лёгкое обновление wsid не удалось', error);
+    return false;
+  }
+}
+
 async function ensureFreshSession(force = false): Promise<void> {
   const session = loadSession();
 
@@ -170,6 +213,13 @@ async function ensureFreshSession(force = false): Promise<void> {
       : !hasValidSession()
         ? 'сессия отсутствует'
         : `возраст ${sessionAgeMinutes(session!)} мин`;
+
+    if (!force && session && needsSessionRefresh(session) && hasValidSession()) {
+      log(`Refresh сессии (${reason}) — пробуем wsid redirect`);
+      const ok = await tryLightWsidRefresh(session);
+      if (ok) return;
+    }
+
     log(`Re-bootstrap (${reason})`);
     invalidateSession();
     await bootstrapSession(shouldKeepBrowserOpen());
@@ -216,10 +266,14 @@ async function runSingleCheck(): Promise<string> {
     } catch (error) {
       if (error instanceof SessionExpiredError || error instanceof AmbiguousResponseError) {
         logError('Сессия недействительна', error);
-        invalidateSession();
-        await closeBrowserSession(activeBrowserSession);
-        activeBrowserSession = null;
-        await bootstrapSession(shouldKeepBrowserOpen());
+        const refreshed = session ? await tryLightWsidRefresh(session) : false;
+
+        if (!refreshed) {
+          invalidateSession();
+          await closeBrowserSession(activeBrowserSession);
+          activeBrowserSession = null;
+          await bootstrapSession(shouldKeepBrowserOpen());
+        }
         session = loadSession();
 
         if (!session) {
@@ -240,9 +294,29 @@ async function runSingleCheck(): Promise<string> {
       log(`Найдено свободных слотов: ${bookable.length}`);
       bookable.forEach((s, i) => log(`  ${i + 1}. ${s.date_time}${s.unit ? ` (${s.unit})` : ''} → ${s.link}`));
 
-      await notifySlotsFound(bookable, session);
-      recordCheckResult(`найдено ${slots.length} слотов`);
-      return `найдено ${slots.length} слотов`;
+      let booked = false;
+
+      if (isAutoBookEnabled()) {
+        for (const slot of bookable) {
+          try {
+            if (await tryAutoBook(slot, session)) {
+              booked = true;
+              break;
+            }
+          } catch (error) {
+            if (error instanceof BookingError) {
+              logError('Auto-book не удался', error);
+            } else {
+              throw error;
+            }
+          }
+        }
+      }
+
+      await sendExtraSlotAlerts(bookable, session, booked);
+      await notifySlotsFound(bookable, session, booked);
+      recordCheckResult(booked ? `забронировано / найдено ${slots.length}` : `найдено ${slots.length} слотов`);
+      return booked ? `забронировано: ${bookable[0].date_time}` : `найдено ${slots.length} слотов`;
     }
 
     log('Свободных окон нет');
@@ -304,12 +378,13 @@ async function main(): Promise<void> {
 
   log('═'.repeat(50));
   log('Termin-Hunter — мониторинг Zulassungsstelle Leipzig');
-  log('Режим: гибрид (API search_result + Playwright bootstrap)');
+  log(`Режим: гибрид (bootstrap=${BOOTSTRAP_MODE}, auto-book=${isAutoBookEnabled()})`);
   log(`Рабочие часы: ${getWorkHoursLabel()}`);
   log(`Интервал: ~${CHECK_INTERVAL_MS / 1000} сек (burst: ${getPollIntervalMs()} мс)`);
   log(`Headless: ${HEADLESS}`);
   log(`Браузер: ${BROWSER_CHANNEL ?? 'chromium (playwright)'}`);
   log(`Burst browser: ${BURST_KEEP_BROWSER_OPEN ? 'да' : 'нет'}`);
+  log(`Wsid refresh: ${WSID_REFRESH_ONLY ? 'redirect' : 'полный bootstrap'}`);
   log('═'.repeat(50));
 
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {

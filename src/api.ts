@@ -17,6 +17,7 @@ export interface ApiSlot {
   datetime_iso86001?: string;
   link: string;
   unit?: string;
+  unit_uid?: string;
   duration?: string;
 }
 
@@ -135,6 +136,7 @@ function mapRawSlot(raw: Record<string, unknown>): ApiSlot | null {
     date_time,
     link,
     unit: typeof raw.unit === 'string' ? raw.unit : undefined,
+    unit_uid: typeof raw.unit_uid === 'string' ? raw.unit_uid : undefined,
     duration: typeof raw.duration === 'string' ? raw.duration : undefined,
     datetime_iso86001:
       typeof raw.datetime_iso86001 === 'string' ? raw.datetime_iso86001 : undefined,
@@ -208,7 +210,13 @@ function parseSlotsFromText(text: string): ApiSlot[] {
 }
 
 function isSessionExpiredHtml(html: string): boolean {
-  return /session_expired|Object moved/i.test(html);
+  if (/Ihre Sitzung ist abgelaufen/i.test(html)) return true;
+  if (/id=["']step_session_expired["']/i.test(html)) return true;
+  if (/Keine freien Termine|json_appointment_list|services-list|step_search_results/i.test(html)) {
+    return false;
+  }
+  if (/Object moved/i.test(html)) return true;
+  return false;
 }
 
 function isNoSlotsHtml(html: string): boolean {

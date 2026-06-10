@@ -39,9 +39,9 @@ export function parseSessionFromUrl(url: string): Pick<SmartCxSession, 'uid' | '
   }
 }
 
-/** uid для API-запросов: service-specific, если известен */
+/** uid портала для search_result / booking URL (не UUID услуги из get_service_list) */
 export function getApiUid(session: SmartCxSession): string {
-  return session.serviceUid ?? session.uid;
+  return session.uid;
 }
 
 export function sessionAgeMs(session: SmartCxSession): number {

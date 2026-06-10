@@ -10,6 +10,9 @@ const WORK_START = process.env.WORK_HOURS_START ?? '07:00';
 const WORK_END = process.env.WORK_HOURS_END ?? '19:00';
 
 const BURST_INTERVAL_MS = parseInt(process.env.BURST_INTERVAL_MS ?? '30000', 10);
+/** Агрессивный burst (leipzigappointmentsbot): опрос каждую минуту */
+const BURST_AGGRESSIVE_INTERVAL_MS = parseInt(process.env.BURST_AGGRESSIVE_INTERVAL_MS ?? '60000', 10);
+const BURST_AGGRESSIVE = (process.env.BURST_AGGRESSIVE ?? 'true').toLowerCase() !== 'false';
 const PRE_RELEASE_INTERVAL_MS = parseInt(process.env.PRE_RELEASE_INTERVAL_MS ?? '60000', 10);
 const BURST_WINDOW_MINUTES = parseInt(process.env.BURST_WINDOW_MINUTES ?? '45', 10);
 const PRE_RELEASE_MINUTES = parseInt(process.env.PRE_RELEASE_MINUTES ?? '5', 10);
@@ -127,7 +130,9 @@ export function getPollMode(): PollMode {
 
 export function getPollModeLabel(): string {
   const mode = getPollMode();
-  if (mode === 'burst') return 'burst (выброс слотов)';
+  if (mode === 'burst') {
+    return BURST_AGGRESSIVE ? 'burst агрессивный (~1 мин)' : 'burst (выброс слотов)';
+  }
   if (mode === 'pre_release') return 'pre-release (скоро выброс)';
   return 'обычный';
 }
@@ -135,7 +140,7 @@ export function getPollModeLabel(): string {
 export function getPollIntervalMs(): number {
   const mode = getPollMode();
 
-  if (mode === 'burst') return BURST_INTERVAL_MS;
+  if (mode === 'burst') return BURST_AGGRESSIVE ? BURST_AGGRESSIVE_INTERVAL_MS : BURST_INTERVAL_MS;
   if (mode === 'pre_release') return PRE_RELEASE_INTERVAL_MS;
 
   return parseInt(process.env.CHECK_INTERVAL_MS ?? '240000', 10);

@@ -269,6 +269,7 @@ function escapeHtmlAttr(url: string): string {
 export async function notifySlotsFound(
   slots: ApiSlot[],
   session: SmartCxSession,
+  booked = false,
 ): Promise<void> {
   const newSlots = slots.filter((slot) => !sentSlotKeys.has(slotKey(slot)));
 
@@ -295,14 +296,22 @@ export async function notifySlotsFound(
 
   const checkedAt = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
 
+  const headline = booked
+    ? '✅ <b>Termin-Hunter: Termin забронирован!</b>'
+    : '🚨 <b>Termin-Hunter: свободный Termin!</b>';
+
+  const footer = booked
+    ? `<i>${escapeHtml(checkedAt)} · проверьте email для подтверждения</i>`
+    : `<i>${escapeHtml(checkedAt)} · wsid действует ~20 мин, бронируйте сразу</i>`;
+
   const message = [
-    '🚨 <b>Termin-Hunter: свободный Termin!</b>',
+    headline,
     '',
     slotLines,
     '',
     `📎 <a href="${calendarUrl}">Календарь (если прямая ссылка не открылась)</a>`,
     '',
-    `<i>${escapeHtml(checkedAt)} · wsid действует ~20 мин, бронируйте сразу</i>`,
+    footer,
   ].join('\n');
 
   await telegraf.telegram.sendMessage(chatId, message, {
