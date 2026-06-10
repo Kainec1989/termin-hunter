@@ -54,10 +54,16 @@ const BURST_KEEP_BROWSER_OPEN =
   (process.env.BURST_KEEP_BROWSER_OPEN ?? 'true').toLowerCase() !== 'false';
 
 let isRunning = true;
-let forceCheckRequested = false;
 let wakeScheduler: (() => void) | null = null;
 let preBootstrapDone = false;
 let activeBrowserSession: BrowserSession | null = null;
+let checkChain: Promise<string> = Promise.resolve('');
+
+async function executeCheck(): Promise<string> {
+  const run = checkChain.then(() => runSingleCheck());
+  checkChain = run.catch(() => '');
+  return run;
+}
 
 registerShutdownCallback(() => {
   isRunning = false;
@@ -68,8 +74,8 @@ registerShutdownCallback(() => {
 });
 
 registerForceCheckCallback(() => {
-  forceCheckRequested = true;
   wakeScheduler?.();
+  return executeCheck();
 });
 
 function setupSignalHandlers(): void {
@@ -192,7 +198,7 @@ async function pollWithSession(session: NonNullable<ReturnType<typeof loadSessio
   return pollSlots(session);
 }
 
-async function runSingleCheck(): Promise<void> {
+async function runSingleCheck(): Promise<string> {
   try {
     await handlePreBootstrap();
     await ensureFreshSession();
@@ -236,14 +242,17 @@ async function runSingleCheck(): Promise<void> {
 
       await notifySlotsFound(bookable, session);
       recordCheckResult(`найдено ${slots.length} слотов`);
-    } else {
-      log('Свободных окон нет');
-      recordCheckResult('свободных окон нет');
+      return `найдено ${slots.length} слотов`;
     }
+
+    log('Свободных окон нет');
+    recordCheckResult('свободных окон нет');
+    return 'свободных окон нет';
   } catch (error) {
     logError('Ошибка при проверке', error);
     recordError();
     recordCheckResult('ошибка');
+    throw error;
   } finally {
     if (!shouldKeepBrowserOpen() && activeBrowserSession) {
       await closeBrowserSession(activeBrowserSession);
@@ -259,15 +268,6 @@ async function schedulerLoop(): Promise<void> {
       log(`Вне рабочих часов (${getWorkHoursLabel()}) — завершение на сегодня`);
       setMonitoringActive(false);
       break;
-    }
-
-    if (forceCheckRequested) {
-      forceCheckRequested = false;
-      log('Внеочередная проверка (/check)');
-      await runSingleCheck();
-
-      if (!isRunning || !isWithinWorkingHours()) break;
-      continue;
     }
 
     const baseInterval = getPollIntervalMs();
@@ -325,7 +325,7 @@ async function main(): Promise<void> {
   await startTelegramBot();
   log('Telegram: push-уведомления только при найденном Termin (/status /stop /check — по запросу)');
 
-  await runSingleCheck();
+  void executeCheck().catch((error) => logError('Ошибка при стартовой проверке', error));
   await schedulerLoop();
 
   await closeBrowserSession(activeBrowserSession);

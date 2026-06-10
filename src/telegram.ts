@@ -9,11 +9,11 @@ import type { SmartCxSession } from './session';
 import { sessionAgeMinutes, SESSION_TTL_MS, SESSION_REFRESH_MS } from './session';
 import { enrichBookingLink, getCalendarUrl } from './api';
 import { getBerlinTimeString, getWorkHoursLabel, isWithinWorkingHours } from './schedule';
-import { log } from './logger';
+import { log, logError } from './logger';
 
 let bot: Telegraf | null = null;
 let shutdownCallback: (() => void) | null = null;
-let forceCheckCallback: (() => void) | null = null;
+let forceCheckCallback: (() => Promise<string>) | null = null;
 let monitoringActive = true;
 let lastCheckAt: string | null = null;
 let lastCheckResult: string | null = null;
@@ -55,8 +55,12 @@ function isAuthorizedChat(chatId: number | undefined): boolean {
   return String(chatId) === getChatId();
 }
 
-export function registerForceCheckCallback(callback: () => void): void {
+export function registerForceCheckCallback(callback: () => Promise<string>): void {
   forceCheckCallback = callback;
+}
+
+export function getLastCheckResultText(): string | null {
+  return lastCheckResult;
 }
 
 export function registerShutdownCallback(callback: () => void): void {
@@ -188,17 +192,25 @@ export async function startTelegramBot(): Promise<void> {
 
   telegraf.use(async (ctx, next) => {
     if (!isAuthorizedChat(ctx.chat?.id)) {
+      log(`Telegram: игнор команды от chat_id=${ctx.chat?.id ?? 'unknown'}`);
       return;
     }
     await next();
   });
 
+  telegraf.catch((error, ctx) => {
+    logError(`Telegram handler (${ctx.updateType})`, error);
+    void ctx.reply('❌ Внутренняя ошибка бота. Попробуйте /status.').catch(() => undefined);
+  });
+
   telegraf.command('stop', async (ctx) => {
+    log('Telegram: команда /stop');
     await ctx.reply('⏹ Останавливаю мониторинг...', { parse_mode: 'HTML' });
     await requestShutdown('/stop');
   });
 
   telegraf.command('status', async (ctx) => {
+    log('Telegram: команда /status');
     await ctx.reply(statusText(), {
       parse_mode: 'HTML',
       ...stopKeyboard(),
@@ -206,8 +218,23 @@ export async function startTelegramBot(): Promise<void> {
   });
 
   telegraf.command('check', async (ctx) => {
-    await ctx.reply('🔍 Запускаю внеочередную проверку...');
-    forceCheckCallback?.();
+    log('Telegram: команда /check');
+
+    if (!forceCheckCallback) {
+      await ctx.reply('❌ Проверка недоступна — агент ещё не инициализирован.');
+      return;
+    }
+
+    await ctx.reply('🔍 Запускаю внеочередную проверку…');
+
+    try {
+      const result = await forceCheckCallback();
+      await ctx.reply(`✅ Проверка завершена: ${escapeHtml(result)}`, { parse_mode: 'HTML' });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logError('Telegram /check', error);
+      await ctx.reply(`❌ Ошибка проверки: ${escapeHtml(detail)}`, { parse_mode: 'HTML' });
+    }
   });
 
   telegraf.action('stop_monitoring', async (ctx) => {
@@ -220,7 +247,15 @@ export async function startTelegramBot(): Promise<void> {
     await requestShutdown('кнопка');
   });
 
-  await telegraf.launch();
+  log('Telegram: подключение к Bot API…');
+  const me = await telegraf.telegram.getMe();
+  log(`Telegram-бот @${me.username} подключён`);
+
+  // launch() не await — в Telegraf 4 он блокируется на вечном long-polling
+  void telegraf.launch({ dropPendingUpdates: true }).catch((error) => {
+    logError('Telegram polling остановлен', error);
+  });
+
   log('Telegram-бот: команды /stop /status /check активны');
 
   process.once('SIGINT', () => telegraf.stop('SIGINT'));
